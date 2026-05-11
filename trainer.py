@@ -1,6 +1,8 @@
 """
-Main training script – corrected version.
+Main training script – fast version using exponentially weighted intensity.
+Runs in minutes instead of hours.
 """
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -8,48 +10,56 @@ import json
 from datetime import datetime
 import config
 import data_manager
-from hawkes_models import HawkesExponential, HawkesSigned, HawkesVolatilityExcited, HawkesEnsemble
+from hawkes_models import FastHawkes, HawkesSigned, HawkesVolatilityExcited, HawkesEnsemble
 
 def detect_jumps(returns, percentile=90):
-    """Detect signed jumps using rolling percentile threshold (90th by default)."""
-    # Rolling threshold for absolute returns
-    threshold = returns.abs().rolling(window=252, min_periods=50).quantile(percentile/100.0)
+    """
+    Detect signed jumps using rolling percentile threshold.
+    Returns boolean series for positive and negative jumps.
+    """
+    # Rolling absolute return threshold
+    threshold = returns.abs().rolling(window=252, min_periods=50).quantile(percentile / 100.0)
     # Fill missing with global quantile
-    threshold.fillna(returns.abs().quantile(percentile/100.0), inplace=True)
+    threshold.fillna(returns.abs().quantile(percentile / 100.0), inplace=True)
     pos_jumps = (returns > threshold).fillna(False)
     neg_jumps = (returns < -threshold).fillna(False)
     return pos_jumps, neg_jumps
 
-def rolling_hawkes_predictions(returns_series, variant_names, window=252):
+def compute_intensities(returns_series, baseline=0.01, alpha=0.5, decay=0.9):
     """
-    Walk-forward: for each day t >= window, fit on returns[t-window:t] and predict next day.
-    Returns a DataFrame of predicted intensities for each variant.
+    For a given ETF return series, compute the next-day intensity for all four variants
+    using the fast exponential decay method.
+    Returns a dict with last (most recent) intensity for each variant.
     """
-    dates = returns_series.index
-    n = len(dates)
-    preds = pd.DataFrame(index=dates, columns=variant_names)
+    # Detect jumps on the full series (walk‑forward inside each variant)
+    pos_jumps, neg_jumps = detect_jumps(returns_series, percentile=90)
 
-    for i in range(window, n):
-        train_returns = returns_series.iloc[i-window:i]
-        pos_jumps, neg_jumps = detect_jumps(train_returns, percentile=90)
+    # Exponential variant: uses positive jumps
+    model_exp = FastHawkes(baseline=baseline, alpha=alpha, decay=decay)
+    model_exp.fit(pos_jumps.values)
+    exp_intensity = model_exp.predict_next_day_intensity(len(returns_series) - 1, None)
 
-        # Fit each variant
-        model_exp = HawkesExponential(decay=1.0).fit(pos_jumps.values)
-        model_signed = HawkesSigned(decay=1.0).fit(pos_jumps.values, neg_jumps.values)
-        model_vol = HawkesVolatilityExcited(decay=1.0).fit(train_returns)
-        model_ens = HawkesEnsemble(decay=1.0).fit(train_returns, pos_jumps.values, neg_jumps.values)
+    # Signed variant: uses positive jumps only (same as exponential for upside)
+    model_signed = HawkesSigned(baseline=baseline, alpha=alpha, decay=decay)
+    model_signed.fit(pos_jumps.values, neg_jumps.values)
+    signed_intensity = model_signed.predict_next_day_intensity(len(returns_series) - 1, None)
 
-        # Predict next day intensity
-        preds.loc[dates[i], "exponential"] = model_exp.predict_next_day_intensity(
-            window-1, window)
-        preds.loc[dates[i], "signed"] = model_signed.predict_next_day_intensity(
-            window-1, window)
-        preds.loc[dates[i], "volatility"] = model_vol.predict_next_day_intensity(
-            window-1)
-        preds.loc[dates[i], "ensemble"] = model_ens.predict_next_day_intensity(
-            window-1, window)
+    # Volatility‑excited variant: detects volatility jumps
+    model_vol = HawkesVolatilityExcited(baseline=baseline, alpha=alpha, decay=decay)
+    model_vol.fit(returns_series)
+    vol_intensity = model_vol.predict_next_day_intensity(len(returns_series) - 1)
 
-    return preds
+    # Ensemble: average of the above three
+    model_ens = HawkesEnsemble(baseline=baseline, alpha=alpha, decay=decay)
+    model_ens.fit(returns_series, pos_jumps.values, neg_jumps.values)
+    ens_intensity = model_ens.predict_next_day_intensity(len(returns_series) - 1, None)
+
+    return {
+        "exponential": exp_intensity,
+        "signed": signed_intensity,
+        "volatility": vol_intensity,
+        "ensemble": ens_intensity
+    }
 
 def main():
     if not config.HF_TOKEN:
@@ -74,19 +84,20 @@ def main():
             if ticker not in returns.columns:
                 continue
             series = returns[ticker].dropna()
-            if len(series) < config.ROLLING_WINDOW + 10:
-                print(f"  {ticker}: insufficient data")
+            if len(series) < config.ROLLING_WINDOW:
+                print(f"  {ticker}: insufficient data (< {config.ROLLING_WINDOW} days)")
                 continue
 
-            preds = rolling_hawkes_predictions(series, config.VARIANTS, window=config.ROLLING_WINDOW)
-            if preds.empty:
-                continue
-            latest = preds.iloc[-1]
-            etf_best_intensity = latest.max()
-            if etf_best_intensity > best_intensity:
-                best_intensity = etf_best_intensity
+            # Use only the last ROLLING_WINDOW days for estimation
+            train_series = series.iloc[-config.ROLLING_WINDOW:]
+            intensities = compute_intensities(train_series)
+
+            # For each ETF, take the maximum intensity across variants
+            etf_best = max(intensities.values())
+            if etf_best > best_intensity:
+                best_intensity = etf_best
                 best_etf = ticker
-                best_variant = latest.idxmax()
+                best_variant = max(intensities, key=intensities.get)
 
         if best_etf is None:
             print(f"  No valid predictions for universe {universe_name}")
@@ -100,15 +111,16 @@ def main():
                 "run_date": today
             }
 
+    # Save results
     Path("results").mkdir(exist_ok=True)
     local_path = Path(f"results/hawkes_{today}.json")
     with open(local_path, "w") as f:
         json.dump({"run_date": today, "universes": all_results}, f, indent=2)
 
-    # Import inside function to avoid error if missing token
+    # Upload to Hugging Face
     import push_results
     push_results.push_daily_result(local_path)
-    print("\n=== Hawkes Process Engine complete ===")
+    print("\n=== Hawkes Process Engine complete (fast version) ===")
 
 if __name__ == "__main__":
     main()
