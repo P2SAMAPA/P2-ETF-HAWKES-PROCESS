@@ -1,6 +1,5 @@
 numpy
 pandas
-scipy
 huggingface-hub
 streamlit
 plotly
