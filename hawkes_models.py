@@ -1,97 +1,70 @@
 """
-Hawkes Process models with guaranteed non‑zero intensity.
+Fast Hawkes‑like intensity using exponential weighting.
+No fitting – just a heuristic that captures self‑excitation.
 """
-import numpy as np
-from scipy.optimize import minimize
 
-class HawkesExponential:
-    """Univariate exponential kernel Hawkes process."""
-    def __init__(self, decay=1.0):
-        self.decay = decay
-        self.mu = 0.01      # baseline intensity (small but >0)
-        self.alpha = 0.1
-        self.history = []
+import numpy as np
+import pandas as pd
+
+class FastHawkes:
+    """
+    Computes intensity as: baseline + decayed sum of past jumps.
+    Uses exponential weighting (decay factor per day).
+    """
+    def __init__(self, baseline=0.01, alpha=0.5, decay=0.9):
+        self.baseline = baseline      # mu
+        self.alpha = alpha            # excitation strength
+        self.decay = decay            # per‑day decay factor (0.9 = fast decay)
 
     def fit(self, events):
-        event_times = np.where(events)[0].astype(float)
-        if len(event_times) == 0:
-            self.mu = 0.01
-            self.alpha = 0.0
-            return self
-        T = len(events)
-
-        def neg_log_lik(params):
-            mu, alpha = params
-            if mu <= 0 or alpha < 0 or alpha >= 1:
-                return 1e10
-            ll = 0.0
-            for i, ti in enumerate(event_times):
-                intensity = mu
-                for tj in event_times[:i]:
-                    intensity += alpha * self.decay * np.exp(-self.decay * (ti - tj))
-                if intensity <= 0:
-                    return 1e10
-                ll += np.log(intensity)
-            integral = mu * T
-            for tj in event_times:
-                integral += alpha * (1 - np.exp(-self.decay * (T - tj)))
-            return -ll + integral
-
-        res = minimize(neg_log_lik, [0.01, 0.5], bounds=[(1e-6, None), (0, 0.999)])
-        self.mu, self.alpha = res.x
-        self.history = event_times
+        """
+        events: boolean array (True = jump)
+        Pre‑computes intensity for each day (for training window).
+        Returns intensity at each time step.
+        """
+        intensity = np.zeros(len(events))
+        running = 0.0
+        for i, is_jump in enumerate(events):
+            running = self.decay * running
+            if is_jump:
+                running += self.alpha
+            intensity[i] = self.baseline + running
+        self.history_intensity = intensity
         return self
 
-    def predict_next_day_intensity(self, last_day_idx, total_days):
-        t = last_day_idx + 1
-        intensity = self.mu
-        for tj in self.history:
-            if tj < t:
-                intensity += self.alpha * self.decay * np.exp(-self.decay * (t - tj))
-        return max(intensity, 1e-6)
+    def predict_next_day_intensity(self, last_day_idx, total_days=None):
+        """Return the last computed intensity (for next day)."""
+        if self.history_intensity is None or len(self.history_intensity) == 0:
+            return self.baseline
+        return self.history_intensity[-1]
 
-class HawkesSigned:
-    """Simplified signed: use positive events only for upside intensity."""
-    def __init__(self, decay=1.0):
-        self.decay = decay
-        self.model = HawkesExponential(decay=decay)
+# For compatibility with existing trainer code, we keep the same class names
+HawkesExponential = FastHawkes
 
-    def fit(self, pos_events, neg_events):
-        # For upside intensity, we only care about positive jumps
-        self.model.fit(pos_events)
-        return self
+class HawkesSigned(FastHawkes):
+    """Use same fast logic but only on positive jumps."""
+    def fit(self, pos_events, neg_events=None):
+        # For upside intensity, only positive jumps matter
+        return super().fit(pos_events)
 
-    def predict_next_day_intensity(self, last_day_idx, total_days):
-        return self.model.predict_next_day_intensity(last_day_idx, total_days)
-
-class HawkesVolatilityExcited:
-    def __init__(self, decay=1.0, window=20):
-        self.decay = decay
-        self.window = window
-        self.model = HawkesExponential(decay=decay)
-
+class HawkesVolatilityExcited(FastHawkes):
+    """Same fast logic, applied to volatility jumps."""
     def fit(self, returns):
-        # Realised volatility as rolling standard deviation
-        vol = returns.rolling(window=self.window).std()
-        # Events: vol > 90th percentile of its own history
-        thresh = vol.rolling(window=252, min_periods=50).quantile(0.9)
-        thresh.fillna(vol.quantile(0.9), inplace=True)
-        events = vol > thresh
-        self.model.fit(events.values)
-        return self
-
-    def predict_next_day_intensity(self, last_day_idx):
-        return self.model.predict_next_day_intensity(last_day_idx, None)
+        # Compute volatility jumps (e.g., 90th percentile of rolling vol)
+        vol = returns.rolling(20).std()
+        thresh = vol.rolling(252, min_periods=50).quantile(0.9).fillna(vol.quantile(0.9))
+        events = (vol > thresh).values
+        return super().fit(events)
 
 class HawkesEnsemble:
-    def __init__(self, decay=1.0):
-        self.exp = HawkesExponential(decay=decay)
-        self.signed = HawkesSigned(decay=decay)
-        self.vol = HawkesVolatilityExcited(decay=decay)
+    def __init__(self, baseline=0.01, alpha=0.5, decay=0.9):
+        self.exp = FastHawkes(baseline, alpha, decay)
+        self.signed = FastHawkes(baseline, alpha, decay)
+        self.vol = FastHawkes(baseline, alpha, decay)
 
     def fit(self, returns, pos_events, neg_events):
         self.exp.fit(pos_events)
-        self.signed.fit(pos_events, neg_events)
+        self.signed.fit(pos_events)   # signed only cares about positive
         self.vol.fit(returns)
         return self
 
