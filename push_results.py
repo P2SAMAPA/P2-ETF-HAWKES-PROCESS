@@ -1,13 +1,11 @@
 """
-Upload results to Hugging Face dataset repository.
+Upload results to Hugging Face dataset repository using HfApi.
 """
-from huggingface_hub import HfApi, Repository
-import os
-import shutil
+from huggingface_hub import HfApi
 from pathlib import Path
 import config
 
-def push_daily_result(local_path):
+def push_daily_result(local_path: Path):
     """Upload the local JSON file to Hugging Face."""
     repo_id = config.OUTPUT_REPO
     token = config.HF_TOKEN
@@ -15,14 +13,15 @@ def push_daily_result(local_path):
         print("No HF_TOKEN, skipping upload")
         return
 
-    # Clone or pull repo
-    local_repo = Path("hf_repo")
-    if local_repo.exists():
-        shutil.rmtree(local_repo)
-    repo = Repository(local_dir=local_repo, repo_type="dataset", clone_from=repo_id, use_auth_token=token)
-
-    # Copy file
-    dest = local_repo / local_path.name
-    shutil.copy(local_path, dest)
-    repo.push_to_hub(commit_message=f"Add {local_path.name}")
-    print(f"Uploaded to {repo_id}")
+    api = HfApi()
+    try:
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=local_path.name,
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=token
+        )
+        print(f"Uploaded {local_path.name} to {repo_id}")
+    except Exception as e:
+        print(f"Upload failed: {e}")
