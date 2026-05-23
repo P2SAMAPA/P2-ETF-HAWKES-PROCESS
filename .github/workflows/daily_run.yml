@@ -2,7 +2,7 @@ name: Daily Hawkes Process Run
 
 on:
   schedule:
-    - cron: '30 02 * * 1-5'  # 23:23 UTC weekdays
+    - cron: '30 00 * * 1-6'  # 23:23 UTC weekdays
   workflow_dispatch:
 
 jobs:
